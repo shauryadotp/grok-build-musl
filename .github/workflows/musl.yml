@@ -1,7 +1,5 @@
 # Build statically-linked Linux binaries of Grok Build (xai-grok-pager)
 # for x86_64-unknown-linux-musl and aarch64-unknown-linux-musl.
-#
-# Source tree: https://github.com/xai-org/grok-build
 
 name: musl
 
@@ -15,6 +13,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "SOURCE_REV"
       - ".cargo/**"
       - "crates/**"
       - "bin/**"
@@ -23,14 +22,21 @@ on:
       - ".github/workflows/musl.yml"
 
 concurrency:
-  group: musl-${{ github.workflow }}-${{ github.ref }}
+  group: musl-\( {{ github.workflow }}- \){{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
   PROTOC: ${{ github.workspace }}/bin/protoc
   SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: auto
+  TARGET_CFLAGS: "-D_GNU_SOURCE"
+  CFLAGS_x86_64_unknown_linux_musl: "-D_GNU_SOURCE"
+  CFLAGS_aarch64_unknown_linux_musl: "-D_GNU_SOURCE"
+  JEMALLOC_SYS_WITH_BACKGROUND_THREADS: "0"
+  je_cv_pthread_getname_np: "no"
+  je_cv_secure_getenv: "no"
 
 permissions:
   contents: write
@@ -46,13 +52,17 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
             musl_cc: musl-gcc
+            cc_env: CC_x86_64_unknown_linux_musl
+            linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             musl_cc: musl-gcc
+            cc_env: CC_aarch64_unknown_linux_musl
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -60,7 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config clang llvm nasm \
+            build-essential cmake pkg-config clang llvm lld nasm \
             musl-tools musl-dev protobuf-compiler \
             ca-certificates curl file binutils
           ${{ matrix.musl_cc }} --version
@@ -75,7 +85,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: musl-${{ matrix.target }}
+          prefix-key: musl-${{ matrix.target }}-noj
           shared-key: grok-build
           cache-on-failure: true
 
@@ -91,17 +101,34 @@ jobs:
           bin/protoc --version || {
             echo "bin/protoc (DotSlash) failed; falling back to system protoc"
             echo "PROTOC=$(which protoc)" >> "$GITHUB_ENV"
+            protoc --version
           }
 
       - name: Build release (musl)
         env:
-          CC: ${{ matrix.musl_cc }}
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          TARGET_CC: ${{ matrix.musl_cc }}
         run: |
-          cargo build --locked --release \
+          set -euo pipefail
+          export \( {{ matrix.cc_env }}=" \){{ matrix.musl_cc }}"
+          export \( {{ matrix.linker_env }}=" \){{ matrix.musl_cc }}"
+
+          cargo build \
+            --locked \
+            --release \
             -p xai-grok-pager-bin \
-            --target ${{ matrix.target }}
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --features sandbox-enforce
+
+      - name: Dump native build logs
+        if: failure()
+        run: |
+          echo "::group::jemalloc / cc config.logs"
+          find target -name config.log -print -exec tail -n 80 {} \; || true
+          echo "::endgroup::"
+          echo "::group::failed crate stderr"
+          find target -path '*build*/output' -print -exec tail -n 40 {} \; 2>/dev/null || true
+          echo "::endgroup::"
 
       - name: Package + verify static link
         id: pkg
@@ -109,17 +136,22 @@ jobs:
           set -euo pipefail
           SRC="target/${{ matrix.target }}/release/xai-grok-pager"
           test -x "$SRC"
+
           DEST_DIR="${{ runner.temp }}/dist"
           mkdir -p "$DEST_DIR"
           cp -a "$SRC" "$DEST_DIR/grok"
           strip "$DEST_DIR/grok" || true
           chmod +x "$DEST_DIR/grok"
+
+          echo "== file =="
           file "$DEST_DIR/grok"
+          echo "== ldd =="
           ldd "$DEST_DIR/grok" || true
           "$DEST_DIR/grok" --version || true
+
           ARCHIVE="grok-${{ matrix.target }}.tar.gz"
           tar -C "$DEST_DIR" -czf "$ARCHIVE" grok
-          sha256sum "$ARCHIVE" | tee "${ARCHIVE}.sha256"
+          sha256sum "\( ARCHIVE" | tee " \){ARCHIVE}.sha256"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
           echo "sha256=${ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
 
